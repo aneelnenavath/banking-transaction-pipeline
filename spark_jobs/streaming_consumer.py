@@ -1,3 +1,4 @@
+import os
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, to_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
@@ -8,7 +9,6 @@ spark = SparkSession.builder \
     .config("spark.cassandra.connection.host", "127.0.0.1") \
     .getOrCreate()
 
-# Reduce log noise so we can actually see our own output clearly
 spark.sparkContext.setLogLevel("WARN")
 
 # Define the exact structure of our transaction JSON
@@ -24,7 +24,6 @@ transaction_schema = StructType([
 
 print("Spark session started. Schema defined. Connecting to Kafka...")
 
-# Read the raw stream from Kafka
 raw_stream = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
@@ -32,7 +31,6 @@ raw_stream = spark.readStream \
     .option("startingOffsets", "earliest") \
     .load()
 
-# Parse the raw JSON bytes into structured columns
 parsed_stream = raw_stream.select(
     from_json(col("value").cast("string"), transaction_schema).alias("data")
 ).select("data.*")
@@ -66,12 +64,7 @@ cassandra_query = cassandra_ready_stream.writeStream \
     .start()
 
 
-# --- S3 sink ---
-# Unlike Cassandra, S3 is a natively supported streaming sink (it's
-# file-based), so we can write directly with .format("parquet") instead
-# of needing foreachBatch. Structured Streaming requires a checkpoint
-# location for every streaming write, so it can track exactly which
-# data has already been written if the job restarts.
+# --- S3 sink (natively supported streaming sink - no foreachBatch needed) ---
 s3_query = parsed_stream.writeStream \
     .format("parquet") \
     .option("path", "s3a://anil-banking-transactions-raw/transactions/") \
@@ -79,5 +72,37 @@ s3_query = parsed_stream.writeStream \
     .outputMode("append") \
     .start()
 
-# Wait for all three streaming queries to keep running
+
+# --- Snowflake sink ---
+# Like Cassandra, Snowflake is a database with its own write API, not a
+# native streaming sink, so it also needs foreachBatch. The password is
+# read from an environment variable here, never hardcoded, since this
+# file is committed to a public GitHub repo.
+snowflake_options = {
+    "sfURL": "QCGJNBF-RG43938.snowflakecomputing.com",
+    "sfUser": "ANILNENAVATH162",
+    "sfPassword": os.environ["SNOWFLAKE_PASSWORD"],
+    "sfRole": "BANKING_PIPELINE_ROLE",
+    "sfDatabase": "BANKING_DB",
+    "sfSchema": "BANKING_SCHEMA",
+    "sfWarehouse": "BANKING_WH"
+}
+
+
+def write_to_snowflake(batch_df, batch_id):
+    batch_df.write \
+        .format("net.snowflake.spark.snowflake") \
+        .options(**snowflake_options) \
+        .option("dbtable", "TRANSACTIONS") \
+        .mode("append") \
+        .save()
+    print(f"Batch {batch_id} written to Snowflake.")
+
+
+snowflake_query = cassandra_ready_stream.writeStream \
+    .foreachBatch(write_to_snowflake) \
+    .outputMode("append") \
+    .start()
+
+# Wait for all four streaming queries to keep running
 spark.streams.awaitAnyTermination()
