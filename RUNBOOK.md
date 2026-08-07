@@ -120,13 +120,3 @@ and WSL's own VM process (`VmmemWSL`) pegged at high, sustained CPU.
    preventing Spark from claiming all available cores/memory
 3. Closed unnecessary background apps (browser, chat apps) to free
    additional headroom before running the pipeline
-
-**Interview-relevant takeaway:** this is a real example of diagnosing
-and resolving resource contention across multiple co-located JVM
-services on constrained hardware — the same class of problem that
-shows up in production capacity planning, just at a smaller scale.
-Key diagnostic signals to know: OS-level memory/CPU monitoring,
-distinguishing "slow" from "genuinely stalled" by watching whether
-a metric (batch count) is still incrementing, and reading framework-
-level logs (Spark's `NettyRpcEnv` timeout warnings) to identify where
-in the stack the failure is actually occurring.
