@@ -180,12 +180,29 @@ Verify all four are set (non-zero) before running:
 
 ## Known open issue: memory growth over long runs
 
-With all 4 sinks running together under continuous Kafka load,
-WSL2 memory usage climbed steadily over ~21 batches (15s trigger
-interval) until free memory dropped to ~36MB, at which point the
-job was stopped proactively to avoid another crash. Root cause
-not yet confirmed — candidates: broadcast variable accumulation,
-GC lag under tight heap limits, or checkpoint metadata growth.
-Next step: try increasing trigger interval (e.g. 30s instead of
-15s) to reduce write frequency and observe whether memory
-stabilizes instead of climbing.
+**Update (11 Aug 2026, later session):** found that Cassandra and S3
+sinks had NO trigger set at all (only Snowflake had
+`.trigger(processingTime="15 seconds")`), meaning they were firing
+continuously back-to-back. Added matching 15s triggers to all three
+foreachBatch/native sinks.
+
+**Result:** memory decline was noticeably slower with all three
+sinks throttled (e.g. dropped ~460Mi -> ~422Mi available over 5
+batches, vs. dropping to ~36Mi over ~21 batches previously) - but
+still trends downward over time, not a complete fix.
+
+**Conclusion:** unthrottled sinks were a significant contributor,
+but not the sole cause. Remaining candidates: GC lag under tight
+1g driver/executor heap limits, broadcast variable/state not being
+released between foreachBatch calls, or checkpoint metadata growth.
+
+**Next steps to try:**
+- Increase trigger interval further (e.g. 30s) to isolate whether
+  remaining growth is purely frequency-related
+- Reduce Kafka producer throughput as an alternative lever
+- Investigate explicit cleanup/unpersist calls within foreachBatch
+  functions
+- Alternatively: document a known stable operating window (e.g.
+  "runs cleanly for N batches / M minutes before intervention
+  needed") as an acceptable, honest conclusion for a portfolio
+  project rather than chasing full elimination
