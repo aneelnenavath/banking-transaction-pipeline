@@ -6,7 +6,6 @@ from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 # Create a Spark session - the entry point for any Spark program
 spark = SparkSession.builder \
     .appName("BankTransactionStreamConsumer") \
-    .config("spark.cassandra.connection.host", "127.0.0.1") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
@@ -35,7 +34,6 @@ parsed_stream = raw_stream.select(
     from_json(col("value").cast("string"), transaction_schema).alias("data")
 ).select("data.*")
 
-# Cassandra needs a real TIMESTAMP column named transaction_time
 cassandra_ready_stream = parsed_stream \
     .withColumn("transaction_time", to_timestamp(col("timestamp"))) \
     .drop("timestamp")
@@ -48,36 +46,34 @@ console_query = parsed_stream.writeStream \
     .start()
 
 
-# --- Cassandra sink (needs foreachBatch, not a native streaming sink) ---
-def write_to_cassandra(batch_df, batch_id):
-    batch_df.write \
-        .format("org.apache.spark.sql.cassandra") \
-        .mode("append") \
-        .options(table="transactions", keyspace="banking") \
-        .save()
-    print(f"Batch {batch_id} written to Cassandra.")
+# --- TEMPORARILY DISABLED: Cassandra sink ---
+# Commented out while we isolate and debug the Snowflake sink on its own.
+# Will re-enable once Snowflake is confirmed stable.
+#
+# def write_to_cassandra(batch_df, batch_id):
+#     batch_df.write \
+#         .format("org.apache.spark.sql.cassandra") \
+#         .mode("append") \
+#         .options(table="transactions", keyspace="banking") \
+#         .save()
+#     print(f"Batch {batch_id} written to Cassandra.")
+#
+# cassandra_query = cassandra_ready_stream.writeStream \
+#     .foreachBatch(write_to_cassandra) \
+#     .outputMode("append") \
+#     .start()
 
 
-cassandra_query = cassandra_ready_stream.writeStream \
-    .foreachBatch(write_to_cassandra) \
-    .outputMode("append") \
-    .start()
+# --- TEMPORARILY DISABLED: S3 sink ---
+# s3_query = parsed_stream.writeStream \
+#     .format("parquet") \
+#     .option("path", "s3a://anil-banking-transactions-raw/transactions/") \
+#     .option("checkpointLocation", "s3a://anil-banking-transactions-raw/checkpoints/transactions/") \
+#     .outputMode("append") \
+#     .start()
 
 
-# --- S3 sink (natively supported streaming sink - no foreachBatch needed) ---
-s3_query = parsed_stream.writeStream \
-    .format("parquet") \
-    .option("path", "s3a://anil-banking-transactions-raw/transactions/") \
-    .option("checkpointLocation", "s3a://anil-banking-transactions-raw/checkpoints/transactions/") \
-    .outputMode("append") \
-    .start()
-
-
-# --- Snowflake sink ---
-# Like Cassandra, Snowflake is a database with its own write API, not a
-# native streaming sink, so it also needs foreachBatch. The password is
-# read from an environment variable here, never hardcoded, since this
-# file is committed to a public GitHub repo.
+# --- Snowflake sink (the one we're isolating and testing today) ---
 snowflake_options = {
     "sfURL": "QCGJNBF-RG43938.snowflakecomputing.com",
     "sfUser": "ANILNENAVATH162",
@@ -88,9 +84,12 @@ snowflake_options = {
     "sfWarehouse": "BANKING_WH"
 }
 
-
 def write_to_snowflake(batch_df, batch_id):
-    batch_df.write \
+    ordered_df = batch_df.select(
+        "transaction_id", "account_id", "amount",
+        "transaction_time", "merchant", "location", "transaction_type"
+    )
+    ordered_df.write \
         .format("net.snowflake.spark.snowflake") \
         .options(**snowflake_options) \
         .option("dbtable", "TRANSACTIONS") \
@@ -102,7 +101,8 @@ def write_to_snowflake(batch_df, batch_id):
 snowflake_query = cassandra_ready_stream.writeStream \
     .foreachBatch(write_to_snowflake) \
     .outputMode("append") \
+    .trigger(processingTime="15 seconds") \
     .start()
 
-# Wait for all four streaming queries to keep running
+# Wait for both remaining streaming queries to keep running
 spark.streams.awaitAnyTermination()
