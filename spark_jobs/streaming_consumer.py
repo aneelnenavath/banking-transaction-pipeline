@@ -49,28 +49,28 @@ console_query = parsed_stream.writeStream \
 # --- TEMPORARILY DISABLED: Cassandra sink ---
 # Commented out while we isolate and debug the Snowflake sink on its own.
 # Will re-enable once Snowflake is confirmed stable.
-#
-# def write_to_cassandra(batch_df, batch_id):
-#     batch_df.write \
-#         .format("org.apache.spark.sql.cassandra") \
-#         .mode("append") \
-#         .options(table="transactions", keyspace="banking") \
-#         .save()
-#     print(f"Batch {batch_id} written to Cassandra.")
-#
-# cassandra_query = cassandra_ready_stream.writeStream \
-#     .foreachBatch(write_to_cassandra) \
-#     .outputMode("append") \
-#     .start()
+
+def write_to_cassandra(batch_df, batch_id):
+     batch_df.write \
+         .format("org.apache.spark.sql.cassandra") \
+         .mode("append") \
+         .options(table="transactions", keyspace="banking") \
+         .save()
+     print(f"Batch {batch_id} written to Cassandra.")
+
+cassandra_query = cassandra_ready_stream.writeStream \
+     .foreachBatch(write_to_cassandra) \
+     .outputMode("append") \
+     .start()
 
 
 # --- TEMPORARILY DISABLED: S3 sink ---
-# s3_query = parsed_stream.writeStream \
-#     .format("parquet") \
-#     .option("path", "s3a://anil-banking-transactions-raw/transactions/") \
-#     .option("checkpointLocation", "s3a://anil-banking-transactions-raw/checkpoints/transactions/") \
-#     .outputMode("append") \
-#     .start()
+s3_query = parsed_stream.writeStream \
+     .format("parquet") \
+     .option("path", "s3a://anil-banking-transactions-raw/transactions/") \
+     .option("checkpointLocation", "s3a://anil-banking-transactions-raw/checkpoints/transactions/") \
+     .outputMode("append") \
+     .start()
 
 
 # --- Snowflake sink (the one we're isolating and testing today) ---
