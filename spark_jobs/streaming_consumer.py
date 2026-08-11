@@ -59,19 +59,19 @@ def write_to_cassandra(batch_df, batch_id):
      print(f"Batch {batch_id} written to Cassandra.")
 
 cassandra_query = cassandra_ready_stream.writeStream \
-     .foreachBatch(write_to_cassandra) \
-     .outputMode("append") \
-     .start()
-
+    .foreachBatch(write_to_cassandra) \
+    .outputMode("append") \
+    .trigger(processingTime="15 seconds") \
+    .start()
 
 # --- TEMPORARILY DISABLED: S3 sink ---
 s3_query = parsed_stream.writeStream \
-     .format("parquet") \
-     .option("path", "s3a://anil-banking-transactions-raw/transactions/") \
-     .option("checkpointLocation", "s3a://anil-banking-transactions-raw/checkpoints/transactions/") \
-     .outputMode("append") \
-     .start()
-
+    .format("parquet") \
+    .option("path", "s3a://anil-banking-transactions-raw/transactions/") \
+    .option("checkpointLocation", "s3a://anil-banking-transactions-raw/checkpoints/transactions/") \
+    .outputMode("append") \
+    .trigger(processingTime="15 seconds") \
+    .start()
 
 # --- Snowflake sink (the one we're isolating and testing today) ---
 snowflake_options = {
