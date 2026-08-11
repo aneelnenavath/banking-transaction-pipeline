@@ -120,3 +120,72 @@ and WSL's own VM process (`VmmemWSL`) pegged at high, sustained CPU.
    preventing Spark from claiming all available cores/memory
 3. Closed unnecessary background apps (browser, chat apps) to free
    additional headroom before running the pipeline
+
+## Snowflake sink debugging (11 Aug 2026)
+
+**Bug:** Snowflake connector writes positionally, not by column name.
+`transaction_time` was appended last via `withColumn()`, but the
+Snowflake table has it as the 4th column — caused merchant values
+to be written into the timestamp column, failing with:
+`SQLException: Timestamp 'Sainsburys' is not recognized`
+
+**Fix:** explicitly reorder columns via `.select()` in
+`write_to_snowflake` before writing, matching the target table's
+column order exactly.
+
+## Cassandra memory optimization (11 Aug 2026)
+
+Cassandra's default JVM heap was consuming ~2.25GB (64% of the
+3.5GB WSL2 memory cap) at idle — leaving too little headroom for
+Spark. Recreated the container with explicit heap limits:
+
+    docker stop cassandra-banking
+    docker rm cassandra-banking
+    docker run -d \
+      --name cassandra-banking \
+      -p 9042:9042 \
+      -v 44a5212dd4f93be97201353569a237d4302d3955def7aadb4583af9772275263:/var/lib/cassandra \
+      -e MAX_HEAP_SIZE=512M \
+      -e HEAP_NEWSIZE=100M \
+      cassandra:latest
+
+Result: memory usage dropped to ~870MB. Existing data preserved
+via the named volume (do NOT delete the volume when recreating
+the container).
+
+## Full spark-submit command (all 4 sinks: console, Cassandra, S3, Snowflake)
+
+    spark-submit \
+      --master local[1] \
+      --driver-memory 1g \
+      --executor-memory 1g \
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4,net.snowflake:spark-snowflake_2.12:2.16.0-spark_3.4,net.snowflake:snowflake-jdbc:3.13.30 \
+      spark_jobs/streaming_consumer.py > ~/spark_run.log 2>&1
+
+**IMPORTANT:** the following environment variables MUST be exported
+in the SAME terminal session, before running spark-submit above —
+they do not persist across terminal windows/tabs:
+
+    export AWS_ACCESS_KEY_ID=$(grep aws_access_key_id ~/.aws/credentials | cut -d'=' -f2 | tr -d ' ')
+    export AWS_SECRET_ACCESS_KEY=$(grep aws_secret_access_key ~/.aws/credentials | cut -d'=' -f2 | tr -d ' ')
+    export SNOWFLAKE_USER=<your_username>
+    export SNOWFLAKE_PASSWORD=<your_password>
+
+Verify all four are set (non-zero) before running:
+
+    echo ${#AWS_ACCESS_KEY_ID}
+    echo ${#AWS_SECRET_ACCESS_KEY}
+    echo ${#SNOWFLAKE_USER}
+    echo ${#SNOWFLAKE_PASSWORD}
+
+## Known open issue: memory growth over long runs
+
+With all 4 sinks running together under continuous Kafka load,
+WSL2 memory usage climbed steadily over ~21 batches (15s trigger
+interval) until free memory dropped to ~36MB, at which point the
+job was stopped proactively to avoid another crash. Root cause
+not yet confirmed — candidates: broadcast variable accumulation,
+GC lag under tight heap limits, or checkpoint metadata growth.
+Next step: try increasing trigger interval (e.g. 30s instead of
+15s) to reduce write frequency and observe whether memory
+stabilizes instead of climbing.
