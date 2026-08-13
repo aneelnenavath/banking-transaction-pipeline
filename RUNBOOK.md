@@ -315,3 +315,135 @@ unit or `autossh` for this later if orchestration becomes a daily thing.
 
 **Next:** build a basic Airflow DAG on EC2 that uses this tunnel (via `SSHOperator` or
 a bash `ssh -p 2222 ...` call) to start/stop pipeline components on WSL2.
+
+## 2026-08-13 (afternoon) — Airflow orchestration DAG built and proven; full restart procedure
+
+### Context: full restart after stopping EC2 + closing all WSL2 terminals overnight
+
+Confirmed today's full cold-start sequence works and is now the standard procedure:
+
+1. Start the EC2 instance (`banking-pipeline-airflow`) from the AWS Console. **Note its new
+   public IP** — it changes on every stop/start since no Elastic IP is attached.
+2. SSH into EC2, activate the Airflow venv, run `airflow standalone`:
+```bash
+   ssh -i ~/banking-pipeline-key.pem ubuntu@<NEW_EC2_IP>
+   source ~/airflow/airflow_venv/bin/activate
+   airflow standalone
+```
+   Leave this running in its own terminal.
+3. From a **separate WSL2 terminal** (not EC2), re-establish the reverse tunnel using the
+   new IP:
+```bash
+   ssh -i ~/banking-pipeline-key.pem -R 2222:localhost:22 -N -f ubuntu@<NEW_EC2_IP>
+```
+4. Verify the tunnel is listening (on EC2): `sudo ss -tlnp | grep 2222` — confirm
+   `127.0.0.1:2222` in `LISTEN` state.
+5. Start WSL2 services in order, each in its own terminal (KAFKA_HOME needs re-exporting
+   each fresh terminal — it's `/home/anil_rathod/bigdata/kafka`, not set globally):
+```bash
+   export KAFKA_HOME=/home/anil_rathod/bigdata/kafka
+   $KAFKA_HOME/bin/zookeeper-server-start.sh $KAFKA_HOME/config/zookeeper.properties
+   # then, new terminal:
+   $KAFKA_HOME/bin/kafka-server-start.sh $KAFKA_HOME/config/server.properties
+   # then Cassandra (needs Docker Desktop running on Windows first):
+   docker start cassandra-banking
+```
+6. **Known recurring issue:** if the Kafka topic ends up recreated fresh (WSL2 restart
+   wipes `/tmp/kafka-logs`), the S3 sink's checkpoint will be stale again, same root
+   cause as documented this morning. Fix is the same:
+```bash
+   aws s3 rm --recursive s3://anil-banking-transactions-raw/checkpoints/transactions/
+```
+   (Note: AWS CLI uses `s3://`, not the Spark-only `s3a://` scheme used inside the
+   Python job.)
+7. Start producer, then consumer (credentials re-exported fresh each terminal — see
+   morning's RUNBOOK entry for the export commands). Run the full `spark-submit`
+   command **as a single line**, not with backslash line continuations — pasting a
+   multi-line backslash-continued command into this terminal setup unreliably split it
+   into separate commands (`--master: command not found` etc.). Single-line form:
+```bash
+   spark-submit --master local[1] --driver-memory 1g --executor-memory 1g --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4,net.snowflake:spark-snowflake_2.12:2.16.0-spark_3.4,net.snowflake:snowflake-jdbc:3.13.30 spark_jobs/streaming_consumer.py > ~/spark_run.log 2>&1
+```
+
+### Reverse tunnel can go stale silently after a network blip
+
+Observed a random `Connection reset by peer` on an interactive EC2 SSH session today.
+Separately, the reverse tunnel's listening socket on EC2 (`127.0.0.1:2222`) can remain
+bound and show as `LISTEN` in `ss -tlnp` even after the underlying SSH connection
+carrying it has actually died — meaning it *looks* fine but doesn't forward traffic.
+Symptom: `paramiko.ssh_exception.SSHException: Error reading SSH protocol banner`
+(preceded by a `TimeoutError`) when Airflow tries to use the connection.
+
+**Fix:** kill the stale listener by PID (shown in `ss -tlnp` output) on EC2, then
+re-run the reverse tunnel command fresh **from WSL2** (not EC2 — the private key only
+exists on WSL2, so running the tunnel command on EC2 itself fails with
+"Identity file not accessible"). Re-verify with `ss -tlnp` afterward — the PID should
+be different from the killed one, confirming a genuinely fresh connection.
+
+### Airflow orchestration DAG: built and proven working (main goal for today)
+
+**Setup:**
+- Installed `apache-airflow-providers-ssh` in the Airflow venv on EC2 (gives access to
+  `SSHOperator`).
+- Created `~/airflow/dags/` (didn't exist by default).
+- Created an Airflow SSH connection (`wsl2_ssh`) via CLI, pointing at `localhost:2222`
+  (routes through the reverse tunnel to WSL2) using the dedicated
+  `~/.ssh/ec2_to_wsl2_key` private key on EC2, with host key checking disabled (fine
+  for this internal setup).
+- `airflow connections test` is disabled by default in this Airflow config (security
+  setting) — used `airflow tasks test <dag_id> <task_id> <date>` instead, which parses
+  a DAG directly from disk and runs a single task synchronously without needing the
+  scheduler to have picked up the file yet. This is the fast way to iterate on a DAG
+  before trusting it to the scheduler (which only rescans the dags folder every 5
+  minutes by default).
+
+**Two DAGs built:** `wsl2_pipeline_start` and `wsl2_pipeline_stop` (both
+`schedule=None`, manually triggered), each with SSHOperator tasks for Zookeeper →
+Kafka → Cassandra (start order) / Cassandra → Kafka → Zookeeper (stop order, reverse —
+stop dependents before dependencies). Zookeeper/Kafka are launched via
+`nohup ... & disown` since `SSHOperator` waits for the remote command to finish, and
+these services run forever in the foreground — backgrounding lets the *task* complete
+while the *service* keeps running.
+
+**Bug found and fixed — `pgrep` matching itself:**
+Initial version used `pgrep -f "org.apache.zookeeper.server.quorum.QuorumPeerMain"` to
+check if a service was already running before starting it. This reported "already
+running" every time, even when nothing was actually running. Root cause: `SSHOperator`
+sends the whole multi-line script to the remote shell as one command (effectively
+`bash -c "<script>"`). That invoking shell process's own command line *contains the
+search string* (since it's written right there in the script as the pgrep pattern).
+`pgrep -f` matches full command lines, so it was matching its own parent process,
+not an actual Zookeeper/Kafka process. This is a classic gotcha with `pgrep -f` inside
+scripts that reference their own search pattern as literal text.
+
+**Fix:** replaced pattern-matching with PID-file tracking — on start, capture the
+backgrounded process's PID (`$!`) into a file (`~/zookeeper.pid`, `~/kafka.pid`); on
+any subsequent check, test whether that specific PID is still alive
+(`kill -0 $(cat ~/zookeeper.pid)`) rather than scanning command lines. Completely
+avoids the self-matching problem and is the more standard approach anyway.
+
+**Also observed:** one `stop_zookeeper` run reported `SSH operator error: exit status
+= -1` even though the kill command had actually succeeded (verified independently on
+WSL2). Exit status `-1` from `SSHOperator` generally means the SSH channel itself
+dropped before the remote command's real exit code could be reported — not that the
+command failed. Lesson: a "failed" Airflow task over a tunnel like this doesn't always
+mean the remote action didn't happen; worth an independent verification step
+(pgrep/PID check, `docker ps`, etc.) when in doubt, especially before assuming
+something needs re-running.
+
+**End-to-end proof completed:** ran the full stop sequence for real (confirmed via
+direct `kill -0` / `docker ps` checks that Zookeeper, Kafka, and Cassandra were
+genuinely down — not just trusting Airflow's own logs), then ran the full start
+sequence for real (confirmed all three genuinely back up with fresh PIDs). This
+demonstrates the DAG can actually control the pipeline's lifecycle, not just detect
+existing state.
+
+### Housekeeping
+
+- Snowflake credentials were briefly visible in plain text during a screenshot shared
+  in this session (via `export SNOWFLAKE_PASSWORD=...`). Password reset afterward as a
+  precaution. Going forward, prefer describing credential export commands generically
+  rather than pasting real values into any shared context.
+- Next step: build a small Word-doc-shareable explanation of this DAG for interview
+  prep, once the rest of Project 3 (fraud-flagging, if attempted) is settled. Not
+  urgent today.
